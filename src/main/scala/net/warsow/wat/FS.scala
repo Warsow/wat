@@ -82,10 +82,16 @@ object FSWalker {
   private trait CollectingDirFiles { self: PathVisitor =>
     val entries = mutable.HashMap.empty[VfsEntry, RealEntry]
 
-    def tryVisitingFile(path: JPath): Option[(VfsFile, RealFile)] = {
-      for (recognizedKind <- getFileKind(path)) yield {
-        val underlying = RealFile(path)
-        (VfsFile(RealPath(path), recognizedKind), underlying)
+    def tryClassifyingFile(path: JPath): Either[String, (VfsFile, RealFile)] = {
+      getFileKind(path).right.map { classifiedFileKind: VfsFileKind =>
+        (VfsFile(RealPath(path), classifiedFileKind), RealFile(path))
+      }
+    }
+
+    override def visitOtherFile(path: JPath): Unit = {
+      tryClassifyingFile(path) match {
+        case Left(warning) => this.warnings += Tuple2(path, warning)
+        case Right(virtualAndReal) => this.entries += virtualAndReal
       }
     }
 
@@ -108,9 +114,6 @@ object FSWalker {
       this.entries ++= entries
       this.warnings ++= warnings
     }
-
-    override def visitOtherFile(path: JPath): Unit =
-      this.entries ++= tryVisitingFile(path)
   }
 
   private class SubDirVisitor(dir: JPath) extends PathVisitor(dir) with CollectingDirFiles {
@@ -122,9 +125,6 @@ object FSWalker {
 
     override def visitPakFile(path: JPath): Unit =
       this.warnings += Tuple2(path, "A pak file is not located in a root directory")
-
-    override def visitOtherFile(path: JPath): Unit =
-      this.entries ++= tryVisitingFile(path)
   }
 
   private class PakFileVisitor(pathOfPak: JPath) extends SimpleFileVisitor[JPath] {
@@ -184,5 +184,6 @@ object FSWalker {
     lowerCase.endsWith(".pk3") || lowerCase.endsWith(".pkwsw")
   }
 
-  def getFileKind(path: JPath): Option[VfsFileKind] = None
+  def getFileKind(path: JPath): Either[String, VfsFileKind] =
+    Left(s"getFileKind() is not implemented for a file at `$path`")
 }
