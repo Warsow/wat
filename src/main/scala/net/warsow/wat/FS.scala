@@ -26,12 +26,98 @@ case class PathInPak(pathOfPak: JPath, pathInPak: JPath) extends VfsPath {
 }
 
 sealed abstract class VfsFileKind
+
+object VfsFileKind {
+  private val matchers = mutable.ArrayBuffer[FileKindMatcher[_]]()
+
+  // This is the only way to get global objects registered
+  // (as they're loaded lazily and won't get touched otherwise)
+  matchers ++= Seq(Texture, Sound, Material, Model, Library, Bsp, Text, Cfg, Ui)
+  matchers ++= Seq(AiFile, SoundEnvFile, L10n, Bsp, Skin, Hud, Font, Video, Script)
+
+  def apply(path: JPath): (Traversable[String], Option[VfsFileKind]) = {
+    val warnings = mutable.ArrayBuffer[String]()
+    // Iterate interrupting early at a first match and collecting warnings.
+    // Note that the early interruption is a quite nasty thing for a purist
+    // but we should do that as some matchers may perform IO/blocking ops
+    val iter = matchers.asInstanceOf[Seq[FileKindMatcher[VfsFileKind]]].iterator
+    while (iter.hasNext) {
+      iter.next().apply(path) match {
+        case Left(warning) => warnings += warning
+        case Right(Some(kind)) => return (warnings, Some(kind))
+        case Right(None) =>
+      }
+    }
+    (warnings, None)
+  }
+}
+
+abstract class FileKindMatcher[K <: VfsFileKind] {
+  def apply(path: JPath): Either[String, Option[K]]
+}
+
+class ExtensionMatcher[K <: VfsFileKind](cons: String => K, extensions: String*) extends FileKindMatcher[K] {
+  private val matchAgainst = extensions.map(_.toLowerCase(Locale.ROOT).ensuring(_.startsWith(".")))
+
+  def apply(path: JPath): Either[String, Option[K]] = {
+    val pathLastPart = path.getName(path.getNameCount - 1).toString.toLowerCase(Locale.ROOT)
+    Right(matchAgainst.find(extension => pathLastPart.endsWith(extension)).map(cons.apply))
+  }
+}
+
 case class Texture(extension: String) extends VfsFileKind
+object Texture extends ExtensionMatcher(s => new Texture(s), ".tga", ".ktx", ".png", ".jpg", ".jpeg")
+
 case class Sound(extension: String) extends VfsFileKind
-case class Shader(extension: String) extends VfsFileKind
+object Sound extends ExtensionMatcher(s => new Sound(s), ".wav", ".ogg", ".m3u")
+
+case class Material() extends VfsFileKind
+object Material extends ExtensionMatcher(_ => new Material(), ".shader")
+
+case class Model(extension: String) extends VfsFileKind
+object Model extends ExtensionMatcher(s => new Model(s), ".md3", ".iqm")
+
 case class Executable() extends VfsFileKind
+
 case class Library(extension: String) extends VfsFileKind
-case class Other(extension: Option[String]) extends VfsFileKind
+object Library extends ExtensionMatcher(s => new Library(s), ".so", ".dll", ".dylib")
+
+case class Text() extends VfsFileKind
+object Text extends ExtensionMatcher(_ => new Text(), ".txt")
+
+case class Cfg() extends VfsFileKind
+object Cfg extends ExtensionMatcher(_ => new Cfg(), ".cfg")
+
+case class AiFile(extension: String) extends VfsFileKind
+object AiFile extends ExtensionMatcher(s => new AiFile(s), ".aas", ".spots", ".navmesh", ".areavis", ".floorvis")
+
+case class L10n() extends VfsFileKind
+object L10n extends ExtensionMatcher(_ => new L10n(), ".po")
+
+case class Bsp() extends VfsFileKind
+object Bsp extends ExtensionMatcher(_ => new Bsp(), ".bsp")
+
+// Should it be just a model?
+case class Skin() extends VfsFileKind
+object Skin extends ExtensionMatcher(_ => new Skin(), ".skin")
+
+case class Hud() extends VfsFileKind
+object Hud extends ExtensionMatcher(_ => new Hud(), ".hud")
+
+case class Font(extension: String) extends VfsFileKind
+object Font extends ExtensionMatcher(s => new Font(s), ".ttf", ".otf")
+
+case class Video(extension: String) extends VfsFileKind
+object Video extends ExtensionMatcher(s => new Video(s), ".ogv", ".roq")
+
+case class SoundEnvFile(extension: String) extends VfsFileKind
+object SoundEnvFile extends ExtensionMatcher(s => new SoundEnvFile(s), ".graph", ".table", ".leafprops")
+
+case class Ui(extension: String) extends VfsFileKind
+object Ui extends ExtensionMatcher(s => new Ui(s), ".rml", ".rcss")
+
+case class Script(extension: String) extends VfsFileKind
+object Script extends ExtensionMatcher(s => new Script(s), ".as", ".gt", ".gtd")
 
 sealed abstract class VfsEntry {
   def path: VfsPath
@@ -82,16 +168,12 @@ object FSWalker {
   private trait CollectingDirFiles { self: PathVisitor =>
     val entries = mutable.HashMap.empty[VfsEntry, RealEntry]
 
-    def tryClassifyingFile(path: JPath): Either[String, (VfsFile, RealFile)] = {
-      getFileKind(path).right.map { classifiedFileKind: VfsFileKind =>
-        (VfsFile(RealPath(path), classifiedFileKind), RealFile(path))
-      }
-    }
-
     override def visitOtherFile(path: JPath): Unit = {
-      tryClassifyingFile(path) match {
-        case Left(warning) => this.warnings += Tuple2(path, warning)
-        case Right(virtualAndReal) => this.entries += virtualAndReal
+      val (newWarnings, maybeKind) = VfsFileKind.apply(path)
+      warnings ++= newWarnings.map(s => (path, s))
+      maybeKind match {
+        case Some(kind) => entries += Tuple2(VfsFile(RealPath(path), kind), RealFile(path))
+        case None => warnings += Tuple2(path, s"Can't find a kind of `$path`")
       }
     }
 
@@ -137,12 +219,18 @@ object FSWalker {
       if (isAPakFile(file, attrs)) {
         warnings += Tuple2(file, "A pak file is inside other pak file")
       } else {
-        getFileKind(file) match {
-          case Left(warning) => warnings += Tuple2(file, warning)
-          case Right(kind) => addPakFile(file, kind)
-        }
+        visitOtherFile(file)
       }
       FileVisitResult.CONTINUE
+    }
+
+    private def visitOtherFile(file: JPath): Unit = {
+      val (newWarnings, maybeKind) = VfsFileKind.apply(file)
+      warnings ++= newWarnings.map(s => (file, s))
+      maybeKind match {
+        case Some(kind) => addPakFile(file, kind)
+        case None => warnings += Tuple2(file, s"Can't find a kind of $file")
+      }
     }
 
     private def addPakFile(pathInPak: JPath, classifiedKind: VfsFileKind): Unit = {
@@ -189,7 +277,4 @@ object FSWalker {
     val lowerCase = path.toString.toLowerCase(Locale.ROOT)
     lowerCase.endsWith(".pk3") || lowerCase.endsWith(".pkwsw")
   }
-
-  def getFileKind(path: JPath): Either[String, VfsFileKind] =
-    Left(s"getFileKind() is not implemented for a file at `$path`")
 }
