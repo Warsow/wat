@@ -51,17 +51,17 @@ case class RealDir(path: JPath) extends RealContainer
 case class RealPak(path: JPath) extends RealContainer
 
 object FSWalker {
+  private def isOtherFile(path: JPath, attrs: BasicFileAttributes): Boolean =
+    attrs.isRegularFile && !hasPakExtension(path)
+
+  private def isASubDir(path: JPath, attrs: BasicFileAttributes): Boolean =
+    attrs.isDirectory
+
+  private def isAPakFile(path: JPath, attrs: BasicFileAttributes): Boolean =
+    attrs.isRegularFile && hasPakExtension(path)
+
   private abstract class PathVisitor(protected val dir: JPath) extends SimpleFileVisitor[JPath] {
     val warnings: mutable.Buffer[(JPath, String)] = mutable.ArrayBuffer[(JPath, String)]()
-
-    def isOtherFile(path: JPath, attrs: BasicFileAttributes): Boolean =
-      attrs.isRegularFile && !hasPakExtension(path)
-
-    def isASubDir(path: JPath, attrs: BasicFileAttributes): Boolean =
-      attrs.isDirectory
-
-    def isAPakFile(path: JPath, attrs: BasicFileAttributes): Boolean =
-      attrs.isRegularFile && hasPakExtension(path)
 
     final override def visitFile(file: JPath, attrs: BasicFileAttributes): FileVisitResult = {
       if (isASubDir(file, attrs)) {
@@ -128,22 +128,28 @@ object FSWalker {
   }
 
   private class PakFileVisitor(pathOfPak: JPath) extends SimpleFileVisitor[JPath] {
-    val subdirs = mutable.HashMap.empty[String, VfsDir]
+    private val subdirs = mutable.HashMap.empty[String, VfsDir]
+    private val warnings = mutable.ArrayBuffer.empty[(JPath, String)]
 
     override def visitFile(file: JPath, attrs: BasicFileAttributes): FileVisitResult = {
       // Only regular files are actually read from a ZIP filesystem
       assert(attrs.isRegularFile)
-      for (recognizedKind <- getFileKind(file)) {
-        addPakFile(file, recognizedKind)
+      if (isAPakFile(file, attrs)) {
+        warnings += Tuple2(file, "A pak file is inside other pak file")
+      } else {
+        getFileKind(file) match {
+          case Left(warning) => warnings += Tuple2(file, warning)
+          case Right(kind) => addPakFile(file, kind)
+        }
       }
       FileVisitResult.CONTINUE
     }
 
-    private def addPakFile(pathInPak: JPath, recognizedKind: VfsFileKind): Unit = {
+    private def addPakFile(pathInPak: JPath, classifiedKind: VfsFileKind): Unit = {
       val parentPath = pathInPak.getParent.toAbsolutePath
       val parentKey = parentPath.toString.toLowerCase(Locale.ROOT)
       val existingChildren = subdirs.get(parentKey).map(_.children).getOrElse(Set())
-      val entry = VfsFile(PathInPak(pathOfPak, pathInPak), recognizedKind)
+      val entry = VfsFile(PathInPak(pathOfPak, pathInPak), classifiedKind)
       val parent = VfsDir(PathInPak(pathOfPak, parentPath), existingChildren ++ Set(entry))
       subdirs.put(parentKey, parent)
     }
@@ -155,7 +161,7 @@ object FSWalker {
       val realEntryForThis = RealPak(pathOfPak)
       val topLevelDirs = for (e <- subdirs.values if e.path.isTopLevel) yield e
       val resultPairs = for (e <- topLevelDirs) yield (e, realEntryForThis)
-      (resultPairs, Traversable())
+      (resultPairs, warnings)
     }
   }
 
