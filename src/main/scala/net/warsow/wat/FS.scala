@@ -1,11 +1,15 @@
 package net.warsow.wat
 
+import java.io.InputStream
 import java.net.URI
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.{FileSystems, FileVisitResult, SimpleFileVisitor, Files => JFiles, Path => JPath}
+import java.nio.{ByteBuffer, ByteOrder}
 import java.util.{Collections, Locale}
 
 import scala.collection.mutable
+import scala.util.Try
+import scala.util.control.NonFatal
 
 sealed abstract class VfsPath {
   def parts: IndexedSeq[String]
@@ -28,19 +32,40 @@ case class PathInPak(pathOfPak: JPath, pathInPak: JPath) extends VfsPath {
 sealed abstract class VfsFileKind
 
 object VfsFileKind {
-  private val matchers = mutable.ArrayBuffer[FileKindMatcher[_]]()
-
-  // This is the only way to get global objects registered
-  // (as they're loaded lazily and won't get touched otherwise)
-  matchers ++= Seq(Texture, Sound, Material, Model, Library, Bsp, Text, Cfg, Ui)
-  matchers ++= Seq(AiFile, SoundEnvFile, L10n, Bsp, Skin, Hud, Font, Video, Script)
+  val (expensiveMatchers, cheapMatchers): (Seq[FileKindMatcher[VfsFileKind]], Seq[FileKindMatcher[VfsFileKind]]) = {
+    val matchers = mutable.ArrayBuffer[FileKindMatcher[VfsFileKind]]()
+    // Variance hacks
+    def matchersOf(seq: FileKindMatcher[_]*) = seq.asInstanceOf[Seq[FileKindMatcher[VfsFileKind]]]
+    // This is the only way to get global objects registered
+    // (as they're loaded lazily and won't get touched otherwise)
+    matchers ++= matchersOf(Texture, Sound, Material, Model, Text, Cfg, Ui, ExecutableLike)
+    matchers ++= matchersOf(AiFile, SoundEnvFile, L10n, Bsp, Skin, Hud, Font, Video, Script)
+    matchers.partition(_.isExpensiveToCall)
+  }
 
   def apply(path: JPath): (Traversable[String], Option[VfsFileKind]) = {
     val warnings = mutable.ArrayBuffer[String]()
-    // Iterate interrupting early at a first match and collecting warnings.
+    val kinds = mutable.ArrayBuffer[VfsFileKind]()
+    for (matcher <- cheapMatchers) {
+      matcher.apply(path) match {
+        case Left(warning) => warnings += warning
+        case Right(maybeKind) => kinds ++= maybeKind
+      }
+    }
+
+    // Interrupt early if cheap matchers had any results
     // Note that the early interruption is a quite nasty thing for a purist
-    // but we should do that as some matchers may perform IO/blocking ops
-    val iter = matchers.asInstanceOf[Seq[FileKindMatcher[VfsFileKind]]].iterator
+    // but we should do that as some matches may perform IO/blocking ops
+    if (kinds.nonEmpty) {
+      if (kinds.size > 1) {
+        warnings += s"There were multiple kinds detected: ${kinds.mkString}"
+        return (warnings, None)
+      }
+      return (warnings, kinds.headOption)
+    }
+
+    // We have to perform an explicit loop and interrupt early for reasons described above
+    val iter = expensiveMatchers.iterator
     while (iter.hasNext) {
       iter.next().apply(path) match {
         case Left(warning) => warnings += warning
@@ -54,14 +79,170 @@ object VfsFileKind {
 
 abstract class FileKindMatcher[K <: VfsFileKind] {
   def apply(path: JPath): Either[String, Option[K]]
+  def isExpensiveToCall: Boolean = false
 }
 
-class ExtensionMatcher[K <: VfsFileKind](cons: String => K, extensions: String*) extends FileKindMatcher[K] {
+abstract class ExtensionMatcher[K <: VfsFileKind](cons: String => K, extensions: String*) extends FileKindMatcher[K] {
   private val matchAgainst = extensions.map(_.toLowerCase(Locale.ROOT).ensuring(_.startsWith(".")))
 
   def apply(path: JPath): Either[String, Option[K]] = {
     val pathLastPart = path.getName(path.getNameCount - 1).toString.toLowerCase(Locale.ROOT)
     Right(matchAgainst.find(extension => pathLastPart.endsWith(extension)).map(cons.apply))
+  }
+}
+
+sealed abstract class Platform
+case class WindowsPlatform() extends Platform
+case class LinuxPlatform() extends Platform
+
+sealed abstract class Architecture
+case class ArchX86() extends Architecture
+case class ArchX86_64() extends Architecture
+case class ArchAny() extends Architecture
+
+sealed abstract class ExecutableLike extends VfsFileKind {
+  def platform: Platform
+  def architecture: Architecture
+}
+
+case class Executable(platform: Platform, architecture: Architecture) extends ExecutableLike
+case class Library(platform: Platform, architecture: Architecture) extends ExecutableLike
+case class CommandScript(platform: Platform) extends ExecutableLike {
+  override val architecture = ArchAny()
+}
+
+object ExecutableLike extends FileKindMatcher[ExecutableLike] {
+  override def isExpensiveToCall: Boolean = true
+
+  private def withStream[A](path: JPath)(ops: InputStream => Either[String, A]): Either[String, A] = {
+    var stream: InputStream = null
+    try {
+      stream = JFiles.newInputStream(path)
+      ops(stream)
+    } catch {
+      case NonFatal(_) => Left("An error occurred while reading bytes")
+    } finally {
+      if (stream ne null) Try(stream.close())
+    }
+  }
+
+  private def readBytes(path: JPath, numBytes: Int): Either[String, Option[Array[Byte]]] = {
+    withStream(path) { stream =>
+      val bytes = new Array[Byte](numBytes)
+      val readBytes = stream.read(bytes)
+      Right(if (readBytes == numBytes) Some(bytes) else None)
+    }
+  }
+
+  private def readAsByteBuffer(stream: InputStream, numBytes: Int, tag: String): Either[String, ByteBuffer] = {
+    val bytes = new Array[Byte](numBytes)
+    val readBytes = stream.read(bytes)
+    if (readBytes == numBytes) {
+      Right(ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN))
+    } else {
+      Left(s"Can't read $numBytes of $tag")
+    }
+  }
+
+  private def matchTwoChars(buffer: ByteBuffer, c1: Char, c2: Char): Boolean =
+    buffer.get(0) == c1 && buffer.get(1) == c2
+
+  private def parsePEHeader(buffer: ByteBuffer) = {
+    if (!matchTwoChars(buffer, 'P', 'E')) {
+      Left("Failed to identify a PE header")
+    } else {
+      // Workarounds for JVM unsigned data woes
+      f"${buffer.asShortBuffer().get(2)}%x" match {
+        case "14c" => Right(ArchX86())
+        case "8664" => Right(ArchX86_64())
+        case _ => Left("Unrecognized architecture")
+      }
+    }
+  }
+
+  private def detectWindowsBinaryArch(path: JPath): Either[String, Architecture] = {
+    withStream(path) { stream =>
+      readAsByteBuffer(stream, numBytes = 64, "DOS header").flatMap { dosBuffer =>
+        if (!matchTwoChars(dosBuffer, 'M', 'Z')) {
+          Left("Is not a DOS/Windows MZ executable")
+        } else {
+          val peOffset = dosBuffer.asIntBuffer().get(15)
+          if (peOffset < 64 || peOffset > 4096) {
+            Left(s"Weird PE header offset $peOffset")
+          } else {
+            stream.skip(peOffset - 64)
+            readAsByteBuffer(stream, numBytes = 6, "PE header") flatMap parsePEHeader
+          }
+        }
+      }
+    }
+  }
+
+  private def matchBytes(bytes: Array[Byte], shouldStartWith: Int*): Boolean = {
+    if (bytes.length < shouldStartWith.length) false else {
+      bytes.zip(shouldStartWith) forall { case (b, v) => b == v }
+    }
+  }
+
+  private def matchElf(b: Array[Byte]) = matchBytes(b, shouldStartWith = 0x7f, 'E', 'L', 'F')
+  private def matchShebang(b: Array[Byte]) = matchBytes(b, shouldStartWith = '#', '!')
+
+  private def tryDetectingLinuxArch(path: JPath): Either[String, Option[Architecture]] = {
+    readBytes(path, numBytes = 0x14).flatMap {
+      case Some(b) if matchShebang(b) => Right(Some(ArchAny()))
+      case Some(b) if !matchElf(b) => Right(None)
+      case Some(b) => f"${ByteBuffer.wrap(b).get(0x12)}%x" match {
+        case "3" => Right(Some(ArchX86()))
+        case "3e" => Right(Some(ArchX86_64()))
+        case _ => Left("Unrecognized architecture for an ELF format identified by magic numbers")
+      }
+      // Try reading only 2 bytes then
+      case None => readBytes(path, numBytes = 2) map {
+        case Some(b) if matchShebang(b) => Some(ArchAny())
+        case _ => None
+      }
+    }
+  }
+
+  private def detectLinuxLibrary(path: JPath): Either[String, Option[ExecutableLike]] = {
+    tryDetectingLinuxArch(path).flatMap {
+      case Some(ArchAny()) => Left("Must have a specific architecture")
+      case Some(arch) => Right(Some(Library(LinuxPlatform(), arch)))
+      case _ => Right(None)
+    }
+  }
+
+  private def tryDetectingLinuxScript(path: JPath): Either[String, Option[CommandScript]] = {
+    tryDetectingLinuxArch(path) flatMap {
+      case Some(ArchAny()) => Right(Some(CommandScript(LinuxPlatform())))
+      case Some(_) => Left("Must not have a specific architecture")
+      case _ => Right(None)
+    }
+  }
+
+  private def tryDetectingLinuxExecutableOrScript(path: JPath): Either[String, Option[ExecutableLike]] = {
+    for (maybeArch <- tryDetectingLinuxArch(path)) yield {
+      for (arch <- maybeArch) yield
+        if (arch == ArchAny()) CommandScript(LinuxPlatform()) else Executable(LinuxPlatform(), arch)
+    }
+  }
+
+  override def apply(path: JPath): Either[String, Option[ExecutableLike]] = {
+    path.getName(path.getNameCount - 1).toString.toLowerCase(Locale.ROOT) match {
+      case p if p.endsWith(".dll") =>
+        detectWindowsBinaryArch(path).map(a => Some(Library(WindowsPlatform(), a)))
+      case p if p.endsWith(".exe") =>
+        detectWindowsBinaryArch(path).map(a => Some(Executable(WindowsPlatform(), a)))
+      case p if p.endsWith(".so") =>
+        detectLinuxLibrary(path)
+      case p if p.endsWith(".bat") || p.endsWith(".ps1") =>
+        Right(Some(CommandScript(WindowsPlatform())))
+      case p if p.endsWith(".sh") =>
+        tryDetectingLinuxScript(path)
+      case p if !p.contains(".") || p.endsWith(".x86_64") || p.endsWith(".i386") =>
+        tryDetectingLinuxExecutableOrScript(path)
+      case _ => Right(None)
+    }
   }
 }
 
@@ -76,11 +257,6 @@ object Material extends ExtensionMatcher(_ => new Material(), ".shader")
 
 case class Model(extension: String) extends VfsFileKind
 object Model extends ExtensionMatcher(s => new Model(s), ".md3", ".iqm")
-
-case class Executable() extends VfsFileKind
-
-case class Library(extension: String) extends VfsFileKind
-object Library extends ExtensionMatcher(s => new Library(s), ".so", ".dll", ".dylib")
 
 case class Text() extends VfsFileKind
 object Text extends ExtensionMatcher(_ => new Text(), ".txt")
