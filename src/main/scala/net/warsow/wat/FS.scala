@@ -3,12 +3,12 @@ package net.warsow.wat
 import java.io.InputStream
 import java.net.URI
 import java.nio.file.attribute.BasicFileAttributes
-import java.nio.file.{FileSystems, FileVisitResult, SimpleFileVisitor, Files => JFiles, Path => JPath}
+import java.nio.file.{FileSystems, FileVisitResult, SimpleFileVisitor, Files => JFiles, Path => JPath, Paths => JPaths}
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.{Collections, Locale}
 
 import scala.collection.mutable
-import scala.util.Try
+import scala.util.{Try, Success, Failure}
 import scala.util.control.NonFatal
 
 sealed abstract class VfsPath {
@@ -312,7 +312,9 @@ sealed abstract class RealContainer extends RealEntry
 case class RealDir(path: JPath) extends RealContainer
 case class RealPak(path: JPath) extends RealContainer
 
-object FSWalker {
+class FSWalker(allowedPakParents: JPath*) {
+  assert(allowedPakParents.nonEmpty, "Allowed parent pak directories must be specified")
+
   private def isOtherFile(path: JPath, attrs: BasicFileAttributes): Boolean =
     attrs.isRegularFile && !hasPakExtension(path)
 
@@ -322,8 +324,9 @@ object FSWalker {
   private def isAPakFile(path: JPath, attrs: BasicFileAttributes): Boolean =
     attrs.isRegularFile && hasPakExtension(path)
 
-  private abstract class PathVisitor(protected val dir: JPath) extends SimpleFileVisitor[JPath] {
+  private class DirVisitor(dir: JPath) extends SimpleFileVisitor[JPath] {
     val warnings: mutable.Buffer[(JPath, String)] = mutable.ArrayBuffer[(JPath, String)]()
+    val entries = mutable.HashMap.empty[VfsEntry, RealEntry]
 
     final override def visitFile(file: JPath, attrs: BasicFileAttributes): FileVisitResult = {
       if (isASubDir(file, attrs)) {
@@ -336,15 +339,32 @@ object FSWalker {
       FileVisitResult.CONTINUE
     }
 
-    def visitSubDir(path: JPath): Unit
-    def visitPakFile(path: JPath): Unit
-    def visitOtherFile(path: JPath): Unit
-  }
+    private def visitSubDir(path: JPath): Unit = {
+      val (entry, warnings) = walkDir(path)
+      this.entries += entry
+      this.warnings ++= warnings
+    }
 
-  private trait CollectingDirFiles { self: PathVisitor =>
-    val entries = mutable.HashMap.empty[VfsEntry, RealEntry]
+    private def isPakPlacementValid(pakPath: JPath): Boolean = {
+      Option(pakPath.getParent) exists { pakParent =>
+        allowedPakParents.exists(allowedParent => pakParent.equals(allowedParent))
+      }
+    }
 
-    override def visitOtherFile(path: JPath): Unit = {
+    private val InvalidPakPlacement =
+      "The pak located in this directory is going to be ignored. Were allowed pak parents specified correctly?"
+
+    private def visitPakFile(path: JPath): Unit = {
+      if (!isPakPlacementValid(path)) {
+        this.warnings += Tuple2(path, InvalidPakPlacement)
+      } else {
+        val (entries, warnings) = walkPak(path)
+        this.entries ++= entries
+        this.warnings ++= warnings
+      }
+    }
+
+    private def visitOtherFile(path: JPath): Unit = {
       val (newWarnings, maybeKind) = VfsFileKind.apply(path)
       warnings ++= newWarnings.map(s => (path, s))
       maybeKind match {
@@ -360,32 +380,7 @@ object FSWalker {
     }
   }
 
-  private class RootDirVisitor(root: JPath) extends PathVisitor(root) with CollectingDirFiles {
-    override def visitSubDir(path: JPath): Unit = {
-      val (entry, warnings) = walkSubDir(path)
-      this.entries += entry
-      this.warnings ++= warnings
-    }
-
-    override def visitPakFile(path: JPath): Unit = {
-      val (entries, warnings) = walkPakFile(path)
-      this.entries ++= entries
-      this.warnings ++= warnings
-    }
-  }
-
-  private class SubDirVisitor(dir: JPath) extends PathVisitor(dir) with CollectingDirFiles {
-    override def visitSubDir(path: JPath): Unit = {
-      val (entry, warnings) = walkSubDir(path)
-      this.entries += entry
-      this.warnings ++= warnings
-    }
-
-    override def visitPakFile(path: JPath): Unit =
-      this.warnings += Tuple2(path, "A pak file is not located in a root directory")
-  }
-
-  private class PakFileVisitor(pathOfPak: JPath) extends SimpleFileVisitor[JPath] {
+  private class PakVisitor(pathOfPak: JPath) extends SimpleFileVisitor[JPath] {
     private val subdirs = mutable.HashMap.empty[String, VfsDir]
     private val warnings = mutable.ArrayBuffer.empty[(JPath, String)]
 
@@ -429,28 +424,46 @@ object FSWalker {
     }
   }
 
-  object RootDirVisitor {
-    def exec(root: JPath): ((VfsEntry, RealEntry), Traversable[(JPath, String)]) = new RootDirVisitor(root).exec()
+  private object DirVisitor {
+    def exec(dir: JPath): ((VfsEntry, RealEntry), Traversable[(JPath, String)]) = new DirVisitor(dir).exec()
   }
 
-  object SubDirVisitor {
-    def exec(dir: JPath): ((VfsEntry, RealEntry), Traversable[(JPath, String)]) = new SubDirVisitor(dir).exec()
-  }
-
-  object PakFileVisitor {
+  private object PakVisitor {
     def exec(pathOfPak: JPath): (Traversable[(VfsEntry, RealEntry)], Traversable[(JPath, String)]) =
-      new PakFileVisitor(pathOfPak).exec()
+      new PakVisitor(pathOfPak).exec()
   }
 
-  def walkRootPath(root: JPath): ((VfsEntry, RealEntry), Traversable[(JPath, String)]) = RootDirVisitor.exec(root)
+  private def walkDir(dir: JPath): ((VfsEntry, RealEntry), Traversable[(JPath, String)]) =
+    DirVisitor.exec(dir)
 
-  def walkSubDir(dir: JPath): ((VfsEntry, RealEntry), Traversable[(JPath, String)]) = SubDirVisitor.exec(dir)
+  private def walkPak(path: JPath): (Traversable[(VfsEntry, RealEntry)], Traversable[(JPath, String)]) =
+    PakVisitor.exec(path)
 
-  def walkPakFile(path: JPath): (Traversable[(VfsEntry, RealEntry)], Traversable[(JPath, String)]) =
-    PakFileVisitor.exec(path)
-
-  def hasPakExtension(path: JPath): Boolean = {
+  private def hasPakExtension(path: JPath): Boolean = {
     val lowerCase = path.toString.toLowerCase(Locale.ROOT)
     lowerCase.endsWith(".pk3") || lowerCase.endsWith(".pkwsw")
+  }
+
+  def walkRootPath(root: JPath): ((VfsEntry, RealEntry), Traversable[(JPath, String)]) = walkDir(root)
+}
+
+object FSWalker {
+  def withPakPaths(allowedPakParents: String*): Either[Traversable[String], FSWalker] = {
+    val conversionResults = allowedPakParents map { p => (p, Try(JPaths.get(p))) }
+    val (conversionFaults, convertedPairs) = conversionResults partition { case (_, tryResult) => tryResult.isFailure }
+    if (conversionFaults.nonEmpty) {
+      Left(conversionFaults map { case (string, _) => s"Failed to convert `$string` to a Path"})
+    } else {
+      withPakPaths(convertedPairs.map(_._2.get) :_ *)
+    }
+  }
+
+  def withPakPaths(allowedPakParents: JPath*)(implicit d: DummyImplicit): Either[Traversable[String], FSWalker] = {
+    val nonExistentPaths = for (p <- allowedPakParents if !p.toFile.exists()) yield p
+    if (nonExistentPaths.isEmpty) {
+      Right(new FSWalker(allowedPakParents :_ *))
+    } else {
+      Left(for (p <- nonExistentPaths) yield s"The path $p does not exist")
+    }
   }
 }
