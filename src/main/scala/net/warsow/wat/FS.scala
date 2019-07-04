@@ -162,7 +162,7 @@ object ExecutableLike extends FileKindMatcher[ExecutableLike] {
 
   private def detectWindowsBinaryArch(path: JPath): Either[String, Architecture] = {
     withStream(path) { stream =>
-      readAsByteBuffer(stream, numBytes = 64, "DOS header").flatMap { dosBuffer =>
+      readAsByteBuffer(stream, numBytes = 64, "DOS header") flatMap { dosBuffer =>
         if (!matchTwoChars(dosBuffer, 'M', 'Z')) {
           Left("Is not a DOS/Windows MZ executable")
         } else {
@@ -188,7 +188,7 @@ object ExecutableLike extends FileKindMatcher[ExecutableLike] {
   private def matchShebang(b: Array[Byte]) = matchBytes(b, shouldStartWith = '#', '!')
 
   private def tryDetectingLinuxArch(path: JPath): Either[String, Option[Architecture]] = {
-    readBytes(path, numBytes = 0x14).flatMap {
+    readBytes(path, numBytes = 0x14) flatMap {
       case Some(b) if matchShebang(b) => Right(Some(ArchAny()))
       case Some(b) if !matchElf(b) => Right(None)
       case Some(b) => f"${ByteBuffer.wrap(b).get(0x12)}%x" match {
@@ -205,7 +205,7 @@ object ExecutableLike extends FileKindMatcher[ExecutableLike] {
   }
 
   private def detectLinuxLibrary(path: JPath): Either[String, Option[ExecutableLike]] = {
-    tryDetectingLinuxArch(path).flatMap {
+    tryDetectingLinuxArch(path) flatMap {
       case Some(ArchAny()) => Left("Must have a specific architecture")
       case Some(arch) => Right(Some(Library(LinuxPlatform(), arch)))
       case _ => Right(None)
@@ -450,11 +450,10 @@ class FSWalker(allowedPakParents: JPath*) {
 object FSWalker {
   def withPakPaths(allowedPakParents: String*): Either[Traversable[String], FSWalker] = {
     val conversionResults = allowedPakParents map { p => (p, Try(JPaths.get(p))) }
-    val (conversionFaults, convertedPairs) = conversionResults partition { case (_, tryResult) => tryResult.isFailure }
-    if (conversionFaults.nonEmpty) {
-      Left(conversionFaults map { case (string, _) => s"Failed to convert `$string` to a Path"})
+    if (conversionResults exists { case (_, r) => r.isFailure }) {
+      Left(conversionResults collect { case (string, Failure(_)) => s"Failed to convert `$string` to a Path"})
     } else {
-      withPakPaths(convertedPairs.map(_._2.get) :_ *)
+      withPakPaths(conversionResults collect { case (_, Success(path)) => path } :_ *)
     }
   }
 
